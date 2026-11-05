@@ -1,0 +1,102 @@
+
+name: Build & Deploy to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      deploy_branch:
+        description: Branch to build and deploy
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-agencyai
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      SSH_PORT: 22
+
+    steps:
+      # 1. Get the source code
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_branch || github.ref_name }}
+
+      # 2. Configure Node.js
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # 3. Install dependencies and build React app
+      - name: Install dependencies and build
+        run: |
+          npm ci
+          npm run build
+
+      # 4. Install deployment tools on GitHub runner
+      - name: Install SSH and rsync
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client rsync
+
+      # 5. Load the private deployment key
+      - name: Set up SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+
+      # 6. Configure server host verification
+      - name: Add EC2 to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H -p "$SSH_PORT" "$EC2_HOST" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      # 7. Prepare the EC2 staging directory
+      - name: Prepare EC2
+        run: |
+          ssh -p "$SSH_PORT" "$EC2_USER@$EC2_HOST" '
+            set -e
+            sudo dnf install -y rsync
+            sudo mkdir -p /var/www/agencyai-staging
+            sudo chown ec2-user:ec2-user /var/www/agencyai-staging
+          '
+
+      # 8. Transfer the built React files
+      - name: Upload build to EC2
+        run: |
+          rsync -az --delete \
+            -e "ssh -p $SSH_PORT" \
+            dist/ \
+            "$EC2_USER@$EC2_HOST:/var/www/agencyai-staging/"
+
+      # 9. Publish the new build
+      - name: Deploy to Nginx
+        run: |
+          ssh -p "$SSH_PORT" "$EC2_USER@$EC2_HOST" '
+            set -e
+
+            sudo rsync -a --delete --chown=nginx:nginx \
+              /var/www/agencyai-staging/ \
+              /var/www/agencyai/
+
+            sudo nginx -t
+            sudo systemctl reload nginx
+          '
